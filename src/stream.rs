@@ -12,12 +12,16 @@ pub mod stream {
 			Self { pos: 0, chunk }
 		}
 
+		pub fn info(&self) -> Vec<usize> {
+			vec![self.pos, self.chunk.len()]
+		}
+		
 		pub fn is_end(&self) -> bool {
 			self.pos >= self.chunk.len()
 		}
 		
 		pub fn read(&mut self, size: usize) -> Option<Vec<u8>> {
-			if self.pos + size >= self.chunk.len() { return None; }
+			if self.pos + size > self.chunk.len() { return None; }
 			let buf = self.chunk[self.pos..self.pos+size].to_vec();
 			self.pos += size;
 			Some(buf)

@@ -61,16 +61,28 @@ impl MainData {
 		let mut images: Vec<Image> = Vec::new();
 
 		loop {
-			let Some(gce) = stream.read(8) else { break; };
-			let Some(image_descriptor) = stream.read(10) else { break; };
+			let format = stream.bread().unwrap();
 
-			let Some(code_size) = stream.bread() else { break; };
-			let Some(block_size) = stream.bread() else { break; };
-
-			let Some(block) = stream.read(1 + block_size as usize) else { break; };
-
-			lzw_decode(block, code_size + 1, gct.len() - 1);
+			println!("format {:X}", format);
 			
+			if format == 0x21 {
+				let Some(gce) = stream.read(7) else { break; };
+			} else if format == 0x2C {
+				let Some(image_descriptor) = stream.read(9) else { break; };
+
+				let Some(code_size) = stream.bread() else { break; };
+				
+				let mut block_size = stream.bread().unwrap();
+				let mut block: Vec<u8> = Vec::new();
+				while block_size != 0 {
+					block.append(&mut stream.read(block_size as usize).unwrap());
+					block_size = stream.bread().unwrap();
+				}
+				lzw_decode(&block, code_size, gct.len());
+				
+			} else if format == 0x3B {
+				break;
+			}
 		}
 		
 		Ok(Self { header, height, width, packed_field, global_color_table: gct, images, stream })
@@ -79,138 +91,70 @@ impl MainData {
 	
 }
 
-// https://habr.com/ru/articles/127083/ - useful
-fn lzw_decode(block: Vec<u8>, code_size: u8, reserved: usize) -> Vec<usize> {
+fn lzw_decode(block: &Vec<u8>, code_size: u8, reserved: usize) -> Vec<i32> {
 	
-	let mut min_code = code_size as usize;
+	let clear = 1 << code_size;
+	let end = clear + 1;
+	let mut min_code = 1 + code_size as usize;
 
 	let mut offset: usize = 0;
-	
-	let mut block_str = String::new();
-	for i in block {
-		block_str.push_str(&((i & 1 != 0) as u8).to_string());
-		block_str.push_str(&((i & 2 != 0) as u8).to_string());
-		block_str.push_str(&((i & 4 != 0) as u8).to_string());
-		block_str.push_str(&((i & 8 != 0) as u8).to_string());
-		block_str.push_str(&((i & 16 != 0) as u8).to_string());
-		block_str.push_str(&((i & 32 != 0) as u8).to_string());
-		block_str.push_str(&((i & 64 != 0) as u8).to_string());
-		block_str.push_str(&((i & 128 != 0) as u8).to_string());
-	}
 
-	//println!("end {}, clear {}, reserved {}", end, clear, reserve);
-
-	#[derive(PartialEq)]
-	enum Code {
-		Val(Vec<usize>),
-		Clear,
-		EOI,
-	}
-
-	impl Code {
-		fn unwrap(&self) -> Vec<usize> {
-			if let Code::Val(v) = self {
-				v.clone()
-			} else {
-				panic!("Failed to unwrap");
+	fn read(bin: &Vec<u8>, offset: &mut usize, size: usize) -> usize {
+		let mut code = 0;
+		for i in (0..size) {
+			if (bin[*offset >> 3] & (1 << (*offset & 7))) != 0 {
+				code |= 1 << i;
 			}
+			*offset += 1;
 		}
-	}
-	
-	impl Clone for Code {
-		fn clone(&self) -> Self {
-			match self {
-				Code::Val(v) => Code::Val(v.clone()),
-				Code::Clear => Code::Clear,
-				Code::EOI => Code::EOI
-			}
-		}
-	}
-	
-	fn read(bin_str: &String, offset: &mut usize, bits: usize) -> usize {
-		let val: String = bin_str[*offset..*offset+bits]
-			.chars()
-			.rev()
-			.collect();
-		
-		*offset += bits;
 
-		println!("{}", val);
-		
-		usize::from_str_radix(&val, 2).unwrap()
+		code
 	}
-	
-	let mut code_table: Vec<Code> = (0..reserved)
-		.into_iter()
-		.map(|i| -> Code {
-			Code::Val(vec![i])
-		}).collect();
-	
-	code_table.push(Code::Clear);
-	code_table.push(Code::EOI);
-	
-	let mut index_stream: Vec<usize> = Vec::new();
-	
-	let mut code = read(&block_str, &mut offset, min_code);	
-	code_table.truncate(reserved);
 
-	code = read(&block_str, &mut offset, min_code);
-	index_stream.append(&mut code_table[code].clone().unwrap());
+	let mut code_table: Vec<Vec<i32>> = Vec::new();
+	for i in (0..reserved as i32) {
+		code_table.push([i].to_vec());
+	}
+	code_table.push([].to_vec());
+	code_table.push([-1].to_vec());
 
-	let mut prev_code_info: Vec<usize> = code_table[code].unwrap();
-	
+	let mut index_stream: Vec<i32> = Vec::new();
+
+	let mut code = 0;
+
 	loop {
-		if offset + min_code > block_str.len() {
-			let diff = block_str.len() - offset;
-			code = read(&block_str, &mut offset, diff);
-			println!("{}, {}", offset, min_code);
-			println!("end code - {}, {}, {}", code, diff, block_str.len());
+		let prev_code = code;
+		code = read(&block, &mut offset, min_code);
+
+		if code == clear {
+			code_table.truncate(reserved + 2);
+			min_code = 1 + code_size as usize;
+			continue;
+		}
+		if code == end {
 			break;
 		}
-		
-		if code_table.len() > 2_usize.pow(min_code as u32) {
-			min_code += 1;
 
-			//println!("////////////////////// {} /////////////////////////", min_code);
-		}
-
-		//println!("{}", code_table.len());
-		
-		code = read(&block_str, &mut offset, min_code);
-		let mut code_info = code_table.get(code).cloned();
-		
-		//println!("{}", code);
-		//println!("{:?}", prev_code_info);
-		//println!("index stream - {:?}", index_stream);
-		
-		match code_info {
-			Some(info) => {
-				//println!("Some");
-				
-				index_stream.append(&mut info.clone().unwrap());
-				
-				let k = info.unwrap()[0];
-				prev_code_info.push(k);
-				code_table.push(Code::Val(prev_code_info));
-
-				prev_code_info = info.unwrap();
-			},
-			None => {
-				//println!("None");
-				
-				let k = prev_code_info[0];
-				prev_code_info.push(k);
-				
-				index_stream.append(&mut prev_code_info.clone());
-
-				code_table.push(Code::Val(prev_code_info.clone()));
+		if code < code_table.len() {
+			if prev_code != clear {
+				let mut code_info = code_table[prev_code].clone();
+				code_info.push(code_table[code][0].clone());
+				code_table.push(code_info);
 			}
-		}
+		} else {
+			if code != code_table.len() { assert!(false, "Fuck... {}, {}, {}", code, code_table.len(), min_code); }
 
+			let mut code_info = code_table[prev_code].clone();
+			code_info.push(code_table[prev_code][0].clone());
+			code_table.push(code_info);
+		}
+		index_stream.append(&mut code_table[code].clone());
+		
+		if code_table.len() == 1 << min_code && min_code < 12 {
+			min_code += 1;
+		}
 	}
 
-	println!("//////////// index stream len -  {} /////////////", index_stream.len());
-	
 	index_stream
 }
 
